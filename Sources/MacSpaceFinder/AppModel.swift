@@ -61,18 +61,45 @@ final class AppModel {
     var transferRequest: TransferRequest?
     var transferPhase: TransferPhase = .setup
 
+    /// Loading the sizes remembered from earlier launches.
+    var isRestoring = false
+    /// Bumped whenever sizes change outside a scan, so views showing sizes refresh.
+    private(set) var sizesVersion = 0
+
     /// Allocated size of every folder measured so far.
-    @ObservationIgnored private let store = SizeStore()
+    @ObservationIgnored private let store: SizeStore
+    @ObservationIgnored private let cache: ScanCache?
     @ObservationIgnored private var activeTree: FolderTree?
     @ObservationIgnored private var progressTimer: Timer?
     @ObservationIgnored private var scanID = 0
     @ObservationIgnored private var transferEngine: TransferEngine?
     @ObservationIgnored private var started = false
 
+    /// `cache: nil` keeps nothing between launches (used by tests).
+    init(cache: ScanCache? = .standard, watchChanges: Bool = true) {
+        self.cache = cache
+        store = SizeStore(cache: cache, watchChanges: watchChanges)
+    }
+
     var sortedEntries: [Entry] { entries.sorted(using: sortOrder) }
 
+    /// Explains where the sizes on screen come from when they were remembered from earlier.
+    var rememberedNote: (text: String, offerRescan: Bool)? {
+        _ = sizesVersion
+        if isRestoring { return ("Loading remembered sizes…", false) }
+        guard !isScanning, let tree = store.tree(answering: currentURL.path) else { return nil }
+        let when = tree.scanDate.formatted(.relative(presentation: .named))
+        switch tree.history {
+        case .fresh: return nil
+        case .checking: return ("Sizes remembered from \(when) — checking what changed since…", false)
+        case .upToDate: return ("Sizes remembered from \(when), updated with every change since.", false)
+        case .unverified: return ("Sizes remembered from \(when). This disk may have changed since then.", true)
+        }
+    }
+
     var currentTotal: Int64? {
-        store.size(of: currentURL.path) ?? (isScanning ? nil : entries.reduce(0) { $0 + ($1.size ?? 0) })
+        _ = sizesVersion
+        return store.size(of: currentURL.path) ?? (isScanning ? nil : entries.reduce(0) { $0 + ($1.size ?? 0) })
     }
 
     var selectionSize: Int64 {
@@ -85,20 +112,56 @@ final class AppModel {
 
     // MARK: - Lifecycle
 
-    func start() {
+    func start(at path: String? = nil) {
         guard !started else { return }
         started = true
         refreshVolumes()
         let nc = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification, NSWorkspace.didRenameVolumeNotification] {
             nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.refreshVolumes() }
+                MainActor.assumeIsolated {
+                    self?.refreshVolumes()
+                    self?.store.volumesChanged()
+                }
             }
         }
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.saveRemembered() }
+        }
+        store.onChange = { [weak self] in self?.sizesChanged() }
+
         // `-StartPath /some/folder` on the command line opens that folder instead of Home.
-        let start = UserDefaults.standard.string(forKey: "StartPath") ?? PathUtil.home
+        let start = path ?? UserDefaults.standard.string(forKey: "StartPath") ?? PathUtil.home
         sidebarSelection = start == PathUtil.home ? PathUtil.home : nil
-        navigate(to: URL(fileURLWithPath: start, isDirectory: true))
+        currentURL = PathUtil.canonicalDirectory(URL(fileURLWithPath: start, isDirectory: true))
+        loadEntries()
+        guard let cache else {
+            navigate(to: currentURL)
+            return
+        }
+        // Show remembered sizes first; only scan what isn't remembered.
+        isRestoring = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let restored = cache.loadAll()
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.store.restore(restored)
+                    self.isRestoring = false
+                    self.navigate(to: self.currentURL)
+                }
+            }
+        }
+    }
+
+    /// Writes remembered sizes to disk now (also done when quitting).
+    func saveRemembered() {
+        store.saveNow()
+    }
+
+    private func sizesChanged() {
+        sizesVersion += 1
+        refreshEntrySizes()
     }
 
     func refreshVolumes() {
@@ -194,8 +257,23 @@ final class AppModel {
     func findBiggest() {
         mode = .biggest
         selection = []
-        if biggestRoot?.path == currentURL.path { return }
-        if isScanning, scanRoot?.path == currentURL.path { return }
+        let path = currentURL.path
+        if isScanning, scanRoot?.path == path { return }
+        if let tree = store.treeForBiggest(in: path) {
+            // Already measured (this session or remembered): list from those sizes, no new scan.
+            let url = currentURL
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let list = tree.biggestFolders(in: path)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self, self.currentURL.path == path else { return }
+                        self.biggest = list
+                        self.biggestRoot = url
+                    }
+                }
+            }
+            return
+        }
         startScan(root: currentURL)
     }
 

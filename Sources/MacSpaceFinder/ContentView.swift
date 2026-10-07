@@ -342,6 +342,20 @@ private struct ScanStatusBar: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(.bar)
+        } else if let note = model.rememberedNote {
+            HStack(spacing: 8) {
+                Image(systemName: "clock.arrow.circlepath").foregroundStyle(note.offerRescan ? .orange : .secondary)
+                Text(note.text).foregroundStyle(.secondary)
+                if note.offerRescan {
+                    Button("Rescan") { model.rescan() }
+                        .buttonStyle(.link)
+                }
+                Spacer()
+            }
+            .font(.callout)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.bar)
         }
     }
 }

@@ -43,6 +43,24 @@ Peak memory for the 3M-file scan went from 91 MB to ~70 MB. The new scanner is c
 previous one in the tests: every folder size and the whole "biggest folders" list must match
 exactly (verified on both folders above). External USB disks have not been timed.
 
+## Remembered between launches
+
+Finished scans are saved to `~/Library/Caches/local.macspacefinder/Scans` (a folder only your user
+can read; about 11 MB for a 357k-folder scan, saved or loaded in a few hundredths of a second).
+Reopening the app shows those sizes immediately, without scanning, and **Find Biggest Folders**
+lists from them too.
+
+- **Internal disk:** macOS keeps a history of which folders changed (FSEvents). At launch the app
+  replays the changes made since the scan was saved and re-reads only those folders, so the
+  remembered sizes are current. The status bar says "updated with every change since".
+- **External disks:** that history can't be trusted (exFAT keeps none, and changes made on another
+  computer are never recorded), so remembered sizes are shown with "this disk may have changed
+  since then" and a **Rescan** link.
+- **While the app is open:** every remembered or scanned folder is kept up to date as files change,
+  on internal and external disks alike.
+
+To forget everything, quit the app and delete that folder.
+
 ## Safety rules built in
 
 - An original is removed **only** when the copy finished with zero errors **and** verification
@@ -97,13 +115,16 @@ Sources/MacSpaceFinder/
   App.swift            app entry point
   AppModel.swift       state: navigation, scan cache, transfers
   Scanner.swift        parallel getattrlistbulk scanner (FolderTree) + "biggest folders" picker
-  SizeStore.swift      all scans so far; keeps sizes consistent across rescans and moves
+  SizeStore.swift      all scans so far; keeps them consistent, current and remembered
+  ChangeWatcher.swift  FSEvents folder-change notices (live and replayed history)
+  ScanCache.swift      saves / loads scans between launches
   Transfer.swift       copy / move / migrate engine (system copyfile + verification)
   Volumes.swift        mounted disks and free space
   ContentView.swift    sidebar, tables, toolbar, status bars
   TransferSheet.swift  destination picker, progress, results
   Util.swift           formatting and path helpers, move safety rules
-Tests/                 scanner (incl. comparison with the previous scanner), size store,
+Tests/                 scanner (incl. comparison with the previous scanner), incremental
+                       updates, cache, live and replayed change notices, size store,
                        transfer, exFAT and model tests
 build.sh               builds build/Mac Space Finder.app
 ```

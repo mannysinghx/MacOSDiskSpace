@@ -491,7 +491,7 @@ extension TransferTests {
 @MainActor
 final class ModelTests: XCTestCase {
     func testNestedSelectionTravelsWithParent() {
-        let model = AppModel()
+        let model = AppModel(cache: nil, watchChanges: false)
         model.beginTransfer(.copy, paths: ["/x/a", "/x/a/b", "/x/ab", "/x/c/d"])
         XCTAssertEqual(model.transferRequest?.items.map(\.path), ["/x/a", "/x/ab", "/x/c/d"])
     }
@@ -508,7 +508,7 @@ final class ModelScanTests: TempDirTestCase {
     func testBrowseRescanAndBiggest() async throws {
         let root = try makeTree(base.appendingPathComponent("root"))
         let big = root.appendingPathComponent("big")
-        let model = AppModel()
+        let model = AppModel(cache: nil, watchChanges: false)
 
         model.navigate(to: root)
         XCTAssertTrue(model.isScanning)
@@ -535,5 +535,219 @@ final class ModelScanTests: TempDirTestCase {
         try await waitForScan(model)
         XCTAssertEqual(model.biggestRoot?.path, root.path)
         XCTAssertEqual(model.biggest.first?.path, big.path, "big now holds new.bin + inner, so it is listed itself")
+    }
+}
+
+// MARK: - Keeping sizes current and remembering them
+
+extension TempDirTestCase {
+    /// Every folder of a fresh scan must have the same size in `tree`, and nothing else may exist.
+    func assertMatchesFreshScan(_ tree: FolderTree, file: StaticString = #filePath, line: UInt = #line) {
+        let reference = ReferenceScanner.scan(root: tree.rootURL)
+        var wrong = 0
+        for (dir, size) in reference.sizes where tree.size(of: dir) != size {
+            wrong += 1
+            if wrong <= 5 { XCTFail("\(dir): \(tree.size(of: dir) as Any) vs fresh \(size)", file: file, line: line) }
+        }
+        XCTAssertEqual(wrong, 0, file: file, line: line)
+        XCTAssertEqual(tree.exportNodes().count, reference.sizes.count, "folder count", file: file, line: line)
+        XCTAssertEqual(Set(tree.biggestFolders(limit: .max)), Set(reference.candidates), file: file, line: line)
+    }
+
+    /// Polls on the main actor (the conditions read main-actor state).
+    @MainActor
+    func waitUntil(_ timeout: TimeInterval = 15, _ condition: @escaping () -> Bool) async throws {
+        let end = Date().addingTimeInterval(timeout)
+        while !condition() && Date() < end { try await Task.sleep(nanoseconds: 50_000_000) }
+    }
+}
+
+final class IncrementalTests: TempDirTestCase {
+    func testRefreshingChangedFoldersMatchesFreshScan() throws {
+        let root = try makeTree(base.appendingPathComponent("root"))
+        try write(root.appendingPathComponent("r/sub/f.bin"), bytes: 80_000)
+        let tree = FolderTree(root: root).scan().tree
+
+        try write(root.appendingPathComponent("big/new.bin"), bytes: 2_000_000)          // file added
+        try fm.removeItem(at: root.appendingPathComponent("small.txt"))                  // file removed
+        try write(root.appendingPathComponent("fresh/x/y/z.bin"), bytes: 500_000)        // new nested folders
+        try fm.removeItem(at: root.appendingPathComponent("big/inner"))                  // folder removed
+        try fm.moveItem(at: root.appendingPathComponent("r"), to: root.appendingPathComponent("r2"))  // renamed
+
+        // What FSEvents reports: the folders whose own listing changed.
+        XCTAssertTrue(tree.apply(changedFolders: [root.path + "/big", root.path], wholeSubtrees: []))
+        assertMatchesFreshScan(tree)
+        XCTAssertNil(tree.size(of: root.path + "/big/inner"))
+        XCTAssertNil(tree.size(of: root.path + "/r"))
+        XCTAssertFalse(tree.apply(changedFolders: [root.path + "/big", root.path], wholeSubtrees: []), "repeating is harmless")
+        // Notices for folders that no longer exist, or are outside the tree, are ignored.
+        XCTAssertFalse(tree.apply(changedFolders: [root.path + "/r", base.path], wholeSubtrees: []))
+        assertMatchesFreshScan(tree)
+    }
+
+    func testWholeSubtreeNoticesRescan() throws {
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let tree = FolderTree(root: root).scan().tree
+        try write(root.appendingPathComponent("big/inner/deep/more.bin"), bytes: 700_000)
+        XCTAssertTrue(tree.apply(changedFolders: [], wholeSubtrees: [root.path + "/big"]))
+        assertMatchesFreshScan(tree)
+
+        try write(root.appendingPathComponent("top.bin"), bytes: 10_000)
+        try write(root.appendingPathComponent("big/a2.bin"), bytes: 10_000)
+        XCTAssertTrue(tree.apply(changedFolders: [], wholeSubtrees: [base.path]), "notice above the root = everything")
+        assertMatchesFreshScan(tree)
+    }
+
+    func testMovedAwayThenNoticedIsNotCountedTwice() throws {
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let tree = FolderTree(root: root).scan().tree
+        let inner = root.appendingPathComponent("big/inner")
+        let a = root.appendingPathComponent("big/a.bin")
+        // What the app does after a Move, before FSEvents reports the same change.
+        tree.removeItem(at: inner.path, size: try XCTUnwrap(tree.size(of: inner.path)))
+        tree.removeItem(at: a.path, size: allocated(a))
+        try fm.removeItem(at: inner)
+        try fm.removeItem(at: a)
+        _ = tree.apply(changedFolders: [root.path + "/big"], wholeSubtrees: [])
+        assertMatchesFreshScan(tree)
+    }
+
+    func testBiggestInsideASubfolderMatchesScanningIt() throws {
+        let root = URL(fileURLWithPath: "/System/Library/CoreServices", isDirectory: true)
+        let tree = FolderTree(root: root).scan().tree
+        for sub in ["Applications", "Finder.app", "CoreTypes.bundle"] {
+            let path = root.path + "/" + sub
+            guard fm.fileExists(atPath: path) else { continue }
+            let alone = FolderTree(root: URL(fileURLWithPath: path, isDirectory: true)).scan().tree
+            XCTAssertEqual(Set(tree.biggestFolders(in: path, limit: .max)), Set(alone.biggestFolders(limit: .max)), sub)
+        }
+    }
+}
+
+final class CacheTests: TempDirTestCase {
+    func testSaveAndLoadRoundTrip() throws {
+        let cache = ScanCache(directory: base.appendingPathComponent("cache"))
+        let root = URL(fileURLWithPath: "/System/Library/CoreServices", isDirectory: true)
+        let tree = FolderTree(root: root).scan().tree
+        try cache.save(tree.snapshot())
+        let attrs = try fm.attributesOfItem(atPath: cache.directory.path)
+        XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o700, "only this user can read it")
+
+        let loaded = cache.loadAll()
+        XCTAssertEqual(loaded.count, 1)
+        let back = try XCTUnwrap(loaded.first)
+        XCTAssertTrue(back.restored)
+        XCTAssertEqual(back.id, tree.id)
+        XCTAssertEqual(back.root, tree.root)
+        XCTAssertEqual(back.appliedEventID, tree.appliedEventID)
+        XCTAssertEqual(back.volumeUUID, tree.volumeUUID)
+        XCTAssertEqual(back.scanDate.timeIntervalSince1970, tree.scanDate.timeIntervalSince1970, accuracy: 0.001)
+        assertMatchesFreshScan(back)
+    }
+
+    func testDamagedFilesAreDeletedAndSkipped() throws {
+        let cache = ScanCache(directory: base.appendingPathComponent("cache"))
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let good = FolderTree(root: root).scan().tree
+        try cache.save(good.snapshot())
+        let bad1 = cache.directory.appendingPathComponent("\(UUID().uuidString).msfscan")
+        try Data("not a scan".utf8).write(to: bad1)
+        let goodData = try Data(contentsOf: cache.file(for: good.id))
+        let other = UUID()
+        let bad2 = cache.file(for: other)
+        try goodData.prefix(goodData.count - 3).write(to: bad2)   // truncated
+        let loaded = cache.loadAll()
+        XCTAssertEqual(loaded.map(\.id), [good.id])
+        XCTAssertFalse(fm.fileExists(atPath: bad1.path))
+        XCTAssertFalse(fm.fileExists(atPath: bad2.path))
+    }
+}
+
+@MainActor
+final class RememberAndWatchTests: TempDirTestCase {
+    func testLiveChangeNoticesKeepSizesCurrent() async throws {
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let store = SizeStore(cache: nil, watchChanges: true)
+        let tree = FolderTree(root: root)
+        store.add(tree)
+        store.finished(tree, cancelled: tree.scan().cancelled)
+
+        try write(root.appendingPathComponent("big/inner/live.bin"), bytes: 3_000_000)
+        try write(root.appendingPathComponent("newdir/n.bin"), bytes: 400_000)
+        try fm.removeItem(at: root.appendingPathComponent("small.txt"))
+        let expected = FolderTree(root: root).scan().tree.size(of: root.path)
+        try await waitUntil { store.size(of: root.path) == expected }
+        XCTAssertEqual(store.size(of: root.path), expected, "FSEvents notices should have been applied")
+        assertMatchesFreshScan(tree)
+    }
+
+    func testChangesWhileClosedAreReplayedAtNextLaunch() async throws {
+        let cache = ScanCache(directory: base.appendingPathComponent("cache"))
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let first = SizeStore(cache: cache, watchChanges: false)
+        let tree = FolderTree(root: root)
+        first.add(tree)
+        first.finished(tree, cancelled: tree.scan().cancelled)
+        first.saveNow()
+
+        // "App closed": change things nobody is watching.
+        try write(root.appendingPathComponent("big/while-closed.bin"), bytes: 1_500_000)
+        try fm.removeItem(at: root.appendingPathComponent("big/inner"))
+        try write(root.appendingPathComponent("added/q.bin"), bytes: 60_000)
+        let expected = FolderTree(root: root).scan().tree.size(of: root.path)
+
+        // "Next launch".
+        let second = SizeStore(cache: cache, watchChanges: true)
+        second.restore(cache.loadAll())
+        let restored = try XCTUnwrap(second.trees.first)
+        XCTAssertEqual(restored.history, .checking, "internal disk with matching change history")
+        try await waitUntil { restored.history == .upToDate && second.size(of: root.path) == expected }
+        XCTAssertEqual(restored.history, .upToDate)
+        XCTAssertEqual(second.size(of: root.path), expected)
+        assertMatchesFreshScan(restored)
+    }
+
+    func testUnmatchedHistoryIsUnverifiedAndDeletedFoldersAreForgotten() throws {
+        let cache = ScanCache(directory: base.appendingPathComponent("cache"))
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let real = FolderTree(root: root).scan().tree.snapshot()
+        let foreign = FolderTree.Snapshot(id: UUID(), root: real.root, scanDate: real.scanDate, eventID: real.eventID,
+                                          volumeUUID: "00000000-0000-0000-0000-000000000000", nodes: real.nodes)
+        let gone = FolderTree.Snapshot(id: UUID(), root: base.path + "/deleted-meanwhile", scanDate: real.scanDate,
+                                       eventID: real.eventID, volumeUUID: real.volumeUUID, nodes: [real.nodes[0]])
+        try cache.save(foreign)
+        try cache.save(gone)
+        let store = SizeStore(cache: cache, watchChanges: false)
+        store.restore(cache.loadAll())
+        XCTAssertEqual(store.trees.map(\.id), [foreign.id])
+        XCTAssertEqual(store.trees.first?.history, .unverified)
+        XCTAssertNotNil(store.size(of: root.path), "remembered sizes are still shown")
+        store.saveNow()
+        Thread.sleep(forTimeInterval: 0.3)
+        XCTAssertFalse(fm.fileExists(atPath: cache.file(for: gone.id).path), "cache for a deleted folder removed")
+    }
+
+    func testModelShowsRememberedSizesWithoutScanning() async throws {
+        let cache = ScanCache(directory: base.appendingPathComponent("cache"))
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let first = AppModel(cache: cache, watchChanges: false)
+        first.start(at: root.path)
+        try await waitUntil { !first.isRestoring && !first.isScanning }
+        let bigSize = try XCTUnwrap(first.entries.first { $0.name == "big" }?.size)
+        first.saveRemembered()
+
+        let second = AppModel(cache: cache, watchChanges: false)
+        second.start(at: root.path)
+        XCTAssertTrue(second.isRestoring)
+        try await waitUntil { !second.isRestoring }
+        XCTAssertFalse(second.isScanning, "remembered: no scan needed")
+        XCTAssertEqual(second.entries.first { $0.name == "big" }?.size, bigSize)
+        XCTAssertNotNil(second.rememberedNote)
+
+        second.findBiggest()
+        XCTAssertFalse(second.isScanning, "biggest folders listed from remembered sizes")
+        try await waitUntil { !second.biggest.isEmpty }
+        XCTAssertEqual(second.biggestRoot?.path, root.path)
+        XCTAssertTrue(second.biggest.contains { $0.path == root.path + "/big/inner" })
     }
 }
