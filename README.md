@@ -24,8 +24,24 @@ want to keep it.
 | **Move To…** | Copies, verifies every file arrived with the same size (and links with the same target), then removes the originals. Originals go to the **Trash** by default (empty it to free the space), or can be deleted permanently. |
 | **Migrate…** | Like Move, then leaves a link at the old location pointing to the new one, so apps still find the files. The external disk must be connected for the link to work. |
 
-Sizes are *allocated* sizes (what the files actually take on disk), the same figure Finder's
-"on disk" value uses.
+Sizes are *allocated* sizes (what the files actually take on disk), the same figure `du` reports.
+
+## Scanning speed
+
+Each folder is read with `getattrlistbulk` (one system call returns a whole batch of entries with
+their sizes) on up to 8 threads at once; SSDs answer parallel reads much faster than one-at-a-time
+ones. Folders are kept as a compact tree (parent/child links) rather than one text path per folder.
+
+Measured on an M4 Max (internal SSD, repeat runs):
+
+| Folder | Files / folders | Before | Now |
+|---|---|---|---|
+| /Applications | 838k / 126k | 17.3 s | 1.7–2.1 s |
+| ~/PROJECTS | 3.08M / 357k | 65.4 s | 8.6–9.0 s |
+
+Peak memory for the 3M-file scan went from 91 MB to ~70 MB. The new scanner is checked against the
+previous one in the tests: every folder size and the whole "biggest folders" list must match
+exactly (verified on both folders above). External USB disks have not been timed.
 
 ## Safety rules built in
 
@@ -53,6 +69,9 @@ may ask again after a rebuild.
 swift test
 ```
 
+`MSF_COMPARE_ROOT=/Applications swift test --filter testMatchesPreviousScannerExactly` also
+compares the new and previous scanners folder by folder on a folder of your choice.
+
 The exFAT tests (most external drives use exFAT) run when `MSF_EXFAT_DEST` points to a folder on
 an exFAT disk. A throwaway disk image works:
 
@@ -77,12 +96,14 @@ hdiutil detach /tmp/msf-exfat
 Sources/MacSpaceFinder/
   App.swift            app entry point
   AppModel.swift       state: navigation, scan cache, transfers
-  Scanner.swift        one-pass folder size scanner + "biggest folders" picker
+  Scanner.swift        parallel getattrlistbulk scanner (FolderTree) + "biggest folders" picker
+  SizeStore.swift      all scans so far; keeps sizes consistent across rescans and moves
   Transfer.swift       copy / move / migrate engine (system copyfile + verification)
   Volumes.swift        mounted disks and free space
   ContentView.swift    sidebar, tables, toolbar, status bars
   TransferSheet.swift  destination picker, progress, results
   Util.swift           formatting and path helpers, move safety rules
-Tests/                 scanner, transfer, exFAT and model tests
+Tests/                 scanner (incl. comparison with the previous scanner), size store,
+                       transfer, exFAT and model tests
 build.sh               builds build/Mac Space Finder.app
 ```

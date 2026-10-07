@@ -61,9 +61,10 @@ final class AppModel {
     var transferRequest: TransferRequest?
     var transferPhase: TransferPhase = .setup
 
-    /// Allocated size of every folder measured so far, keyed by canonical path.
-    @ObservationIgnored private var sizes: [String: Int64] = [:]
-    @ObservationIgnored private var scanTask: Task<Void, Never>?
+    /// Allocated size of every folder measured so far.
+    @ObservationIgnored private let store = SizeStore()
+    @ObservationIgnored private var activeTree: FolderTree?
+    @ObservationIgnored private var progressTimer: Timer?
     @ObservationIgnored private var scanID = 0
     @ObservationIgnored private var transferEngine: TransferEngine?
     @ObservationIgnored private var started = false
@@ -71,7 +72,7 @@ final class AppModel {
     var sortedEntries: [Entry] { entries.sorted(using: sortOrder) }
 
     var currentTotal: Int64? {
-        sizes[currentURL.path] ?? (isScanning ? nil : entries.reduce(0) { $0 + ($1.size ?? 0) })
+        store.size(of: currentURL.path) ?? (isScanning ? nil : entries.reduce(0) { $0 + ($1.size ?? 0) })
     }
 
     var selectionSize: Int64 {
@@ -79,7 +80,7 @@ final class AppModel {
     }
 
     func size(of path: String) -> Int64? {
-        sizes[path] ?? entries.first { $0.id == path }?.size
+        store.size(of: path) ?? entries.first { $0.id == path }?.size
     }
 
     // MARK: - Lifecycle
@@ -153,13 +154,14 @@ final class AppModel {
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .isPackageKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey]
         do {
             let urls = try FileManager.default.contentsOfDirectory(at: currentURL, includingPropertiesForKeys: keys, options: [])
+            let known = store.childSizes(of: currentURL.path)
             entries = urls.map { url in
                 let v = try? url.resourceValues(forKeys: Set(keys))
                 let isSymlink = v?.isSymbolicLink == true
                 let isDir = v?.isDirectory == true && !isSymlink
                 let fileSize = Int64(v?.totalFileAllocatedSize ?? v?.fileAllocatedSize ?? 0)
                 return Entry(url: url, name: url.lastPathComponent, isDirectory: isDir, isPackage: v?.isPackage == true,
-                             isSymlink: isSymlink, size: isDir ? sizes[url.path] : fileSize)
+                             isSymlink: isSymlink, size: isDir ? known[url.lastPathComponent] : fileSize)
             }
         } catch {
             entries = []
@@ -168,8 +170,9 @@ final class AppModel {
     }
 
     private func refreshEntrySizes() {
+        let known = store.childSizes(of: currentURL.path)
         for i in entries.indices where entries[i].isDirectory {
-            let s = sizes[entries[i].id]
+            let s = known[entries[i].name]
             if entries[i].size != s { entries[i].size = s }
         }
     }
@@ -177,14 +180,13 @@ final class AppModel {
     // MARK: - Scanning
 
     private func needsScan(_ url: URL) -> Bool {
-        if sizes[url.path] != nil { return false }
+        if store.size(of: url.path) != nil { return false }
         if isScanning, let root = scanRoot, PathUtil.isInside(url.path, root.path) { return false }
         return true
     }
 
     func rescan() {
-        let root = currentURL.path
-        sizes = sizes.filter { !PathUtil.isInside($0.key, root) }
+        store.invalidate(currentURL.path)
         loadEntries()
         startScan(root: currentURL)
     }
@@ -198,48 +200,61 @@ final class AppModel {
     }
 
     func cancelScan() {
-        scanTask?.cancel()
+        activeTree?.cancel()
     }
 
     private func startScan(root: URL) {
-        scanTask?.cancel()
+        activeTree?.cancel()
         scanID += 1
         let id = scanID
+        let tree = FolderTree(root: root)
+        activeTree = tree
+        store.add(tree)
         isScanning = true
         scanRoot = root
         scanFiles = 0
         scanBytes = 0
         scanErrors = 0
         scanCurrent = root.path
-        scanTask = Task.detached(priority: .userInitiated) { [weak self] in
-            let result = FolderScanner.scan(root: root) { progress in
-                DispatchQueue.main.async { MainActor.assumeIsolated { self?.applyScanProgress(progress, id: id) } }
-            }
+
+        // Sizes appear in the table as folders finish; poll 4x a second (also while scrolling).
+        progressTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pollScan(id: id) }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        progressTimer = timer
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = tree.scan()
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.finishScan(result, id: id) } }
         }
     }
 
-    private func applyScanProgress(_ p: ScanProgress, id: Int) {
-        guard id == scanID else { return }
-        sizes.merge(p.newSizes) { _, new in new }
-        scanFiles = p.files
-        scanBytes = p.bytes
-        scanErrors = p.errors
-        scanCurrent = p.currentPath
+    private func pollScan(id: Int) {
+        guard id == scanID, let tree = activeTree else { return }
+        let s = tree.currentStats()
+        scanFiles = s.files
+        scanBytes = s.bytes
+        scanErrors = s.errors
+        scanCurrent = s.currentPath
         refreshEntrySizes()
     }
 
     private func finishScan(_ r: ScanResult, id: Int) {
-        sizes.merge(r.newSizes) { _, new in new }
+        store.finished(r.tree, cancelled: r.cancelled)
         refreshEntrySizes()
         guard id == scanID else { return }
+        progressTimer?.invalidate()
+        progressTimer = nil
+        activeTree = nil
         isScanning = false
-        scanFiles = r.files
-        scanBytes = r.bytes
-        scanErrors = r.errors
+        scanFiles = r.stats.files
+        scanBytes = r.stats.bytes
+        scanErrors = r.stats.errors
         if !r.cancelled {
             biggest = r.biggest
-            biggestRoot = r.root
+            biggestRoot = r.tree.rootURL
         }
     }
 
@@ -288,13 +303,7 @@ final class AppModel {
         for r in results where r.originalRemoved {
             let path = r.source.path
             let removed = size(of: path) ?? 0
-            sizes = sizes.filter { !PathUtil.isInside($0.key, path) }
-            var parent = (path as NSString).deletingLastPathComponent
-            while true {
-                if let s = sizes[parent] { sizes[parent] = max(0, s - removed) }
-                if parent == "/" || parent.isEmpty { break }
-                parent = (parent as NSString).deletingLastPathComponent
-            }
+            store.removed(path, size: removed)
             biggest.removeAll { PathUtil.isInside($0.path, path) }
             for i in biggest.indices where PathUtil.isInside(path, biggest[i].path) {
                 biggest[i].size = max(0, biggest[i].size - removed)

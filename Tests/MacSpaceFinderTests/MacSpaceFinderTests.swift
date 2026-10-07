@@ -57,7 +57,8 @@ class TempDirTestCase: XCTestCase {
 final class ScannerTests: TempDirTestCase {
     func testFolderSizesAndBiggest() throws {
         let root = try makeTree(base.appendingPathComponent("root"))
-        let result = FolderScanner.scan(root: root) { _ in }
+        let result = FolderTree(root: root).scan()
+        let tree = result.tree
 
         let a = allocated(root.appendingPathComponent("big/a.bin"))
         let b = allocated(root.appendingPathComponent("big/inner/b.bin"))
@@ -65,10 +66,14 @@ final class ScannerTests: TempDirTestCase {
         let link = allocated(root.appendingPathComponent("link"))
 
         XCTAssertFalse(result.cancelled)
-        XCTAssertEqual(result.files, 4)
-        XCTAssertEqual(result.newSizes[root.path + "/big/inner"], b)
-        XCTAssertEqual(result.newSizes[root.path + "/big"], a + b)
-        XCTAssertEqual(result.newSizes[root.path], a + b + small + link)
+        XCTAssertEqual(result.stats.files, 4)
+        XCTAssertEqual(result.stats.errors, 0)
+        XCTAssertEqual(tree.size(of: root.path + "/big/inner"), b)
+        XCTAssertEqual(tree.size(of: root.path + "/big"), a + b)
+        XCTAssertEqual(tree.size(of: root.path), a + b + small + link)
+        XCTAssertEqual(tree.childSizes(of: root.path), ["big": a + b])
+        XCTAssertNil(tree.size(of: root.path + "/nope"))
+        XCTAssertNil(tree.size(of: base.path), "outside the tree")
 
         // inner holds > 80% of big, so big is skipped in favour of inner; the root is never listed.
         let listed = result.biggest.map(\.path)
@@ -81,10 +86,196 @@ final class ScannerTests: TempDirTestCase {
         let root = base.appendingPathComponent("root")
         try write(root.appendingPathComponent("Huge.app/Contents/Resources/data.bin"), bytes: 1_000_000)
         try write(root.appendingPathComponent("other/x.bin"), bytes: 10_000)
-        let result = FolderScanner.scan(root: root) { _ in }
+        let result = FolderTree(root: root).scan()
         let listed = result.biggest.map(\.path)
         XCTAssertTrue(listed.contains(root.path + "/Huge.app"), "\(listed)")
         XCTAssertFalse(listed.contains { $0.contains("Huge.app/") }, "\(listed)")
+    }
+
+    func testUnreadableFolderCountsAsErrorAndScanCompletes() throws {
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let locked = root.appendingPathComponent("locked")
+        try write(locked.appendingPathComponent("x.bin"), bytes: 50_000)
+        chmod(locked.path, 0o000)
+        defer { chmod(locked.path, 0o755) }
+        let result = FolderTree(root: root).scan()
+        XCTAssertFalse(result.cancelled)
+        XCTAssertEqual(result.stats.errors, 1)
+        XCTAssertEqual(result.tree.size(of: locked.path), 0)
+        XCTAssertNotNil(result.tree.size(of: root.path))
+    }
+
+    // MARK: New scanner vs the previous (FileManager-based) one
+
+    /// Synthetic tree, then real system folders full of app bundles. Set MSF_COMPARE_ROOT to add
+    /// another folder (e.g. /Applications).
+    func testMatchesPreviousScannerExactly() throws {
+        let synthetic = base.appendingPathComponent("synthetic")
+        try makeTree(synthetic)
+        try write(synthetic.appendingPathComponent("Tool.app/Contents/MacOS/tool"), bytes: 400_000)
+        try write(synthetic.appendingPathComponent("Tool.app/Contents/Resources/r.bin"), bytes: 900_000)
+        try write(synthetic.appendingPathComponent("deep/1/2/3/4/5/f.bin"), bytes: 70_000)
+        try write(synthetic.appendingPathComponent("wide/x.bin"), bytes: 1)
+        for i in 0..<300 { try fm.createDirectory(at: synthetic.appendingPathComponent("wide/d\(i)"), withIntermediateDirectories: true) }
+        try write(synthetic.appendingPathComponent("é-unicode/ü.bin"), bytes: 12_345)
+
+        var roots = [synthetic.path, "/System/Library/CoreServices", "/System/Library/PrivateFrameworks/CoreSymbolication.framework"]
+        if let extra = ProcessInfo.processInfo.environment["MSF_COMPARE_ROOT"] { roots.append(extra) }
+        for path in roots where fm.fileExists(atPath: path) {
+            let url = URL(fileURLWithPath: path, isDirectory: true)
+            let reference = ReferenceScanner.scan(root: url)
+            let result = FolderTree(root: url).scan()
+            XCTAssertFalse(result.cancelled)
+            XCTAssertEqual(result.stats.files, reference.files, path)
+            var mismatches = 0
+            for (dir, size) in reference.sizes where result.tree.size(of: dir) != size {
+                mismatches += 1
+                if mismatches <= 5 { XCTFail("\(dir): new \(result.tree.size(of: dir) as Any) vs previous \(size)") }
+            }
+            XCTAssertEqual(mismatches, 0, path)
+            let everyCandidate = result.tree.biggestFolders(limit: .max)
+            XCTAssertEqual(Set(everyCandidate), Set(reference.candidates), path)
+            XCTAssertEqual(result.biggest, Array(everyCandidate.prefix(FolderTree.biggestLimit)))
+            print("compared \(path): \(reference.sizes.count) folders, \(reference.files) files, \(everyCandidate.count) candidates")
+        }
+    }
+
+    func testSameResultWithOneOrManyWorkers() throws {
+        let root = URL(fileURLWithPath: "/System/Library/CoreServices", isDirectory: true)
+        let reference = ReferenceScanner.scan(root: root)
+        for workers in [1, 3, 8] {
+            let tree = FolderTree(root: root).scan(workers: workers).tree
+            let wrong = reference.sizes.filter { tree.size(of: $0.key) != $0.value }.count
+            XCTAssertEqual(wrong, 0, "workers=\(workers)")
+        }
+    }
+
+    func testCancelLeavesOnlyCorrectFinishedSizes() throws {
+        let root = URL(fileURLWithPath: "/System/Library/CoreServices", isDirectory: true)
+        let reference = ReferenceScanner.scan(root: root)
+        for delay in [0.0, 0.005, 0.02] {
+            let tree = FolderTree(root: root)
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { tree.cancel() }
+            let result = tree.scan()
+            var known = 0
+            for (dir, size) in reference.sizes {
+                guard let got = tree.size(of: dir) else { continue }
+                known += 1
+                XCTAssertEqual(got, size, dir)
+            }
+            if result.cancelled {
+                XCTAssertTrue(result.biggest.isEmpty)
+                XCTAssertNil(tree.size(of: root.path), "an unfinished root has no size")
+            }
+            print("cancel after \(delay)s: cancelled=\(result.cancelled), \(known)/\(reference.sizes.count) folders finished")
+        }
+        let early = FolderTree(root: root)
+        early.cancel()
+        XCTAssertTrue(early.scan().cancelled)
+    }
+}
+
+/// The previous scanner (FileManager enumerator, one thread), kept as a reference. The one
+/// deliberate difference: sizes come from lstat's st_blocks, like the new scanner and `du`.
+/// (FileManager reports 0 bytes for some compressed files that really use one 4 KB block.)
+enum ReferenceScanner {
+    struct Result { var sizes: [String: Int64] = [:]; var files = 0; var candidates: [BigFolder] = [] }
+
+    static func scan(root: URL) -> Result {
+        struct Frame { let path: String; var size: Int64 = 0; var largest: Int64 = 0; let inPackage: Bool; let isPackage: Bool }
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .isVolumeKey, .isPackageKey]
+        var out = Result()
+        var stack = [Frame(path: root.path, inPackage: false, isPackage: false)]
+        func pop() {
+            let f = stack.removeLast()
+            stack[stack.count - 1].size += f.size
+            if !f.inPackage { stack[stack.count - 1].largest = max(stack[stack.count - 1].largest, f.size) }
+            out.sizes[f.path] = f.size
+            let largest = f.isPackage ? 0 : f.largest
+            if !f.inPackage && f.size > 0 && Double(largest) < FolderTree.dominanceShare * Double(f.size) {
+                out.candidates.append(BigFolder(path: f.path, size: f.size))
+            }
+        }
+        let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: [], errorHandler: { _, _ in true })!
+        while let url = en.nextObject() as? URL {
+            while stack.count > en.level { pop() }
+            let v = try? url.resourceValues(forKeys: Set(keys))
+            if v?.isDirectory == true && v?.isSymbolicLink != true {
+                if v?.isVolume == true { en.skipDescendants(); continue }
+                let parent = stack[stack.count - 1]
+                stack.append(Frame(path: url.path, inPackage: parent.inPackage || parent.isPackage, isPackage: v?.isPackage == true))
+            } else {
+                var st = stat()
+                if lstat(url.path, &st) == 0 { stack[stack.count - 1].size += Int64(st.st_blocks) * 512 }
+                out.files += 1
+            }
+        }
+        while stack.count > 1 { pop() }
+        out.sizes[root.path] = stack[0].size
+        return out
+    }
+}
+
+@MainActor
+final class SizeStoreTests: TempDirTestCase {
+    func testRescanReplacesSubfolderAndCorrectsParents() throws {
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let big = root.path + "/big"
+        let store = SizeStore()
+        let first = FolderTree(root: root)
+        store.add(first)
+        let r1 = first.scan()
+        store.finished(first, cancelled: r1.cancelled)
+        let oldBig = try XCTUnwrap(store.size(of: big))
+        let oldRoot = try XCTUnwrap(store.size(of: root.path))
+
+        try write(root.appendingPathComponent("big/new.bin"), bytes: 1_000_000)
+        store.invalidate(big)
+        XCTAssertNil(store.size(of: big), "out of date while rescanning")
+        XCTAssertNil(store.size(of: big + "/inner"))
+        XCTAssertNil(store.childSizes(of: root.path)["big"])
+
+        let second = FolderTree(root: URL(fileURLWithPath: big, isDirectory: true))
+        store.add(second)
+        store.finished(second, cancelled: second.scan().cancelled)
+        let newBig = try XCTUnwrap(store.size(of: big))
+        XCTAssertGreaterThan(newBig, oldBig)
+        XCTAssertEqual(store.size(of: root.path), oldRoot + (newBig - oldBig), "parent corrected")
+        XCTAssertEqual(store.childSizes(of: root.path)["big"], newBig)
+        XCTAssertNotNil(store.size(of: big + "/inner"), "answered by the newer scan")
+        XCTAssertEqual(store.trees.count, 2)
+    }
+
+    func testScanOfParentReplacesScanOfChild() throws {
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let store = SizeStore()
+        for url in [root.appendingPathComponent("big"), root] {
+            let tree = FolderTree(root: url)
+            store.add(tree)
+            store.finished(tree, cancelled: tree.scan().cancelled)
+        }
+        XCTAssertEqual(store.trees.count, 1)
+        XCTAssertEqual(store.trees.first?.root, root.path)
+    }
+
+    func testRemovedFolderAndFileShrinkParents() throws {
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let store = SizeStore()
+        let tree = FolderTree(root: root)
+        store.add(tree)
+        store.finished(tree, cancelled: tree.scan().cancelled)
+        let total = try XCTUnwrap(store.size(of: root.path))
+        let inner = try XCTUnwrap(store.size(of: root.path + "/big/inner"))
+        let bigBefore = try XCTUnwrap(store.size(of: root.path + "/big"))
+
+        store.removed(root.path + "/big/inner", size: inner)
+        XCTAssertNil(store.size(of: root.path + "/big/inner"))
+        XCTAssertEqual(store.size(of: root.path + "/big"), bigBefore - inner)
+        XCTAssertEqual(store.size(of: root.path), total - inner)
+
+        store.removed(root.path + "/big/a.bin", size: 4096)
+        XCTAssertEqual(store.size(of: root.path + "/big"), bigBefore - inner - 4096)
+        XCTAssertEqual(store.size(of: root.path), total - inner - 4096)
     }
 }
 
@@ -224,6 +415,18 @@ final class TransferTests: TempDirTestCase {
         XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: dest.path + "/Code/link"), "small.txt")
     }
 
+    func testScanSkipsMountedDisks() throws {
+        // MSF_EXFAT_DEST is a mounted disk image: scanning the folder that contains the mount
+        // point must not count anything on that disk.
+        let dest = try exfatDest()
+        try write(dest.appendingPathComponent("onDisk.bin"), bytes: 2_000_000)
+        let mountPoint = URL(fileURLWithPath: ProcessInfo.processInfo.environment["MSF_EXFAT_DEST"]!)
+        let parent = mountPoint.deletingLastPathComponent()
+        let tree = FolderTree(root: parent).scan().tree
+        XCTAssertNil(tree.childSizes(of: parent.path)[mountPoint.lastPathComponent])
+        XCTAssertNil(tree.size(of: mountPoint.path))
+    }
+
     func testExFATIllegalNamesNeverLoseData() throws {
         // exFAT forbids ? * | " < > \ in names. Whatever the driver does, the original must
         // either be verified at the destination or stay put.
@@ -291,5 +494,46 @@ final class ModelTests: XCTestCase {
         let model = AppModel()
         model.beginTransfer(.copy, paths: ["/x/a", "/x/a/b", "/x/ab", "/x/c/d"])
         XCTAssertEqual(model.transferRequest?.items.map(\.path), ["/x/a", "/x/ab", "/x/c/d"])
+    }
+}
+
+/// Drives the real AppModel (no UI): browse -> scan -> sizes, cached navigation, rescan, biggest.
+@MainActor
+final class ModelScanTests: TempDirTestCase {
+    private func waitForScan(_ model: AppModel) async throws {
+        for _ in 0..<500 where model.isScanning { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertFalse(model.isScanning, "scan did not finish")
+    }
+
+    func testBrowseRescanAndBiggest() async throws {
+        let root = try makeTree(base.appendingPathComponent("root"))
+        let big = root.appendingPathComponent("big")
+        let model = AppModel()
+
+        model.navigate(to: root)
+        XCTAssertTrue(model.isScanning)
+        try await waitForScan(model)
+        let bigSize = allocated(big.appendingPathComponent("a.bin")) + allocated(big.appendingPathComponent("inner/b.bin"))
+        XCTAssertEqual(model.entries.first { $0.name == "big" }?.size, bigSize)
+        let rootTotal = try XCTUnwrap(model.currentTotal)
+
+        model.navigate(to: big)
+        XCTAssertFalse(model.isScanning, "already measured: no new scan")
+        XCTAssertNotNil(model.entries.first { $0.name == "inner" }?.size)
+
+        try write(big.appendingPathComponent("new.bin"), bytes: 3_000_000)
+        model.rescan()
+        try await waitForScan(model)
+        let added = allocated(big.appendingPathComponent("new.bin"))
+        XCTAssertEqual(model.currentTotal, bigSize + added)
+        model.goUp()
+        XCTAssertFalse(model.isScanning)
+        XCTAssertEqual(model.currentTotal, rootTotal + added, "parent folder corrected after the rescan")
+        XCTAssertEqual(model.entries.first { $0.name == "big" }?.size, bigSize + added)
+
+        model.findBiggest()
+        try await waitForScan(model)
+        XCTAssertEqual(model.biggestRoot?.path, root.path)
+        XCTAssertEqual(model.biggest.first?.path, big.path, "big now holds new.bin + inner, so it is listed itself")
     }
 }
