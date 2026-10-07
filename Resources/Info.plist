@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>MacSpaceFinder</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.macspacefinder</string>
+	<key>CFBundleName</key>
+	<string>Mac Space Finder</string>
+	<key>CFBundleDisplayName</key>
+	<string>Mac Space Finder</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Mac Space Finder measures folder sizes on your Desktop.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Mac Space Finder measures folder sizes in Documents.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Mac Space Finder measures folder sizes in Downloads.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Mac Space Finder copies and moves folders to external disks.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Mac Space Finder can copy folders to network disks.</string>
+</dict>
+</plist>
